@@ -145,7 +145,7 @@ graph_md_nodots <- function(dat, effect = 0, title, subtitle){
     scale_x_discrete(
       limits=c("md_PSmean", "md_PSsd", "md_PSrdiff",
                 "md_PSlargest", "md_mean_sd", "md_all","md_PSgold"),
-      labels=c("Mean", "Standard Dev", "Most Recent", "Largest", "Mean and SD", "All",
+      labels=c("Mean", "SD", "Most Recent", "Largest", "Mean and SD", "All",
                "Gold Standard"),
       
       ) +
@@ -157,12 +157,12 @@ graph_md_nodots <- function(dat, effect = 0, title, subtitle){
     ggplot2::stat_summary(fun = median, geom = "point", color = 'black',
                           size = 1.25, shape = 8)
   
-  ggsave(filename = paste(title, "without dots_morePS.jpeg"),
-         plot = plot2,
-         path = "~/projects/P0047/users/chase.latour/plans/Figures/",
-         units = "in",
-         width = 7,
-         height = 5)
+  # ggsave(filename = paste(title, "without dots_morePS.jpeg"),
+  #        plot = plot2,
+  #        path = "~/projects/P0047/users/chase.latour/plans/Figures/",
+  #        units = "in",
+  #        width = 7,
+  #        height = 5)
   
   return(plot2)
 }
@@ -189,7 +189,11 @@ graph_md_nodots <- function(dat, effect = 0, title, subtitle){
 
 #graph_md_dots(B1, title = "Scenario B1")
 
+bitmap("FIG1.tiff", width=190, height=140, units='mm', type='tifflzw',res=1200)
 graph_md_nodots(B1, title = "Scenario B1")
+dev.off()
+
+
 
 ```
 
