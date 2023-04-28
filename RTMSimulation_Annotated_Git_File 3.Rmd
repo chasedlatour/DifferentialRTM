@@ -1,0 +1,229 @@
+---
+title: "ITP Simulation"
+author: "Chase Latour"
+date: "2/9/2022"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Objective
+
+This document summarizes patient counts for summarizing simulation performance. This is the 3rd file that is run on all of the generated data.
+
+```{r include=FALSE}
+
+# Load packages that need
+library(tidyr)
+library(dplyr)
+library(kableExtra)
+
+```
+
+# Load in the Datasets
+
+We have to load in the simulated data that we need.
+
+```{r}
+
+## Null effect
+
+# N=10,000
+
+A1 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/A1_all_corr_morePS.rds")
+
+A2 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/A2_all_corr_morePS.rds")
+
+A3 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/A3_all_corr_morePS.rds")
+
+A4 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/A4_all_corr_morePS.rds")
+
+RA1 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/RA1_all_corr_morePS.rds")
+
+RA3 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/RA3_all_corr_morePS.rds")
+
+# N=200
+
+B1 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/B1_all_corr_morePS.rds")
+
+B2 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/B2_all_corr_morePS.rds")
+
+B3 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/B3_all_corr_morePS.rds")
+
+B4 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/B4_all_corr_morePS.rds")
+
+RB1 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/RB1_all_corr_morePS.rds")
+
+RB3 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/RB3_all_corr_morePS.rds")
+
+
+
+## Non-Null effect
+
+# N=10,000
+
+A1_50 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/A1_all50_corr_morePS.rds")
+
+A2_50 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/A2_all50_corr_morePS.rds")
+
+A3_50 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/A3_all50_corr_morePS.rds")
+
+A4_50 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/A4_all50_corr_morePS.rds")
+
+RA1_50 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/RA1_all50_corr_morePS.rds")
+
+RA3_50 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/RA3_all50_corr_morePS.rds")
+
+
+# N=200
+
+B1_50 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/B1_all50_corr_morePS.rds")
+
+B2_50 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/B2_all50_corr_morePS.rds")
+
+B3_50 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/B3_all50_corr_morePS.rds")
+
+B4_50 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/B4_all50_corr_morePS.rds")
+
+RB1_50 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/RB1_all50_corr_morePS.rds")
+
+RB3_50 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/RB3_all50_corr_morePS.rds")
+
+```
+
+# Function to Summarize the Data
+
+Write functions that will summarize patient counts.
+
+```{r}
+
+# Create the function that actually creates the variables.
+summarize_n <- function(dataset){
+  
+  # Use the summarize function to calculate the stats of-interest based off the nested data tibble
+  # This will return a tibble that will be inserted as a column into the dataset
+  data1 <- dataset %>%
+    ungroup %>% 
+    summarize(n_rom_sev = sum(treatment == "ROM" & severity_n == 1),
+              n_soc_sev = sum(treatment == "SOC" & severity_n == 1),
+              n_sev = sum(severity_n == 1),
+              n_rom_nsev = sum(treatment == "ROM" & severity_n == 0),
+              n_soc_nsev = sum(treatment == "SOC" & severity_n == 0),
+              n_nsev = sum(severity_n == 0))
+  
+  return(data1)
+
+  
+}
+
+## Apply
+
+summary <- function(dataset){
+  
+  # Apply the above function to the dataset that you're summarizing
+  data1 <- dataset %>% 
+    # Select only those variables that we need (more efficient)
+    select(sim_id, data) %>% 
+    # Calculate the summary tibble
+    mutate(n_summary = purrr::map(data, ~summarize_n(.x))) %>% 
+    # Remove the data that donn't need
+    select(-data) %>% 
+    # Unnest the dataset so that each summary stat is a column.
+    # This will give 1 row per simulation
+    unnest(cols = n_summary)
+  
+  # Calculate the median and IQRs of these new measures
+  data2 <- data1 %>% 
+    ungroup() %>% 
+    summarize(p50_rom_sev = round(median(n_rom_sev), 2), # Trt with rom and more severe
+              p25_rom_sev = round(quantile(n_rom_sev, 0.25), 2),
+              p75_rom_sev = round(quantile(n_rom_sev, 0.75), 2),
+              p50_soc_sev = round(median(n_soc_sev), 2), # Trt with SOC and more severe
+              p25_soc_sev = round(quantile(n_soc_sev, 0.25), 2),
+              p75_soc_sev = round(quantile(n_soc_sev, 0.75), 2),
+              p50_sev = round(median(n_sev), 2), # Number of more-severe
+              p25_sev = round(quantile(n_sev, 0.25), 2),
+              p75_sev = round(quantile(n_sev, 0.75), 2),
+              p50_rom_nsev = round(median(n_rom_nsev), 2), # Trt with rom and less severe
+              p25_rom_nsev = round(quantile(n_rom_nsev, 0.25), 2),
+              p75_rom_nsev = round(quantile(n_rom_nsev, 0.75), 2),
+              p50_soc_nsev = round(median(n_soc_nsev), 2), # Trt with SOC and less severe
+              p25_soc_nsev = round(quantile(n_soc_nsev, 0.25), 2),
+              p75_soc_nsev = round(quantile(n_soc_nsev, 0.75), 2),
+              p50_nsev = round(median(n_nsev), 2), # Number of less-severe
+              p25_nsev = round(quantile(n_nsev, 0.25), 2),
+              p75_nsev = round(quantile(n_nsev, 0.75), 2)) %>% 
+    # Format the IQRs the way that will be able to be visualized.
+    mutate(iqr_rom_severe = paste(p25_rom_sev, p75_rom_sev, sep = ", "),
+           iqr_soc_severe = paste(p25_soc_sev, p75_soc_sev, sep = ", "),
+           iqr_severe = paste(p25_sev, p75_sev, sep = ", "),
+           iqr_rom_nsevere = paste(p25_rom_nsev, p75_rom_nsev, sep = ", "),
+           iqr_soc_nsevere = paste(p25_soc_nsev, p75_soc_nsev, sep = ", "),
+           iqr_nsevere = paste(p25_nsev, p75_nsev, sep = ", ")) %>% 
+    # Select only those variables that want to put in a kable function
+    select(p50_rom_sev, iqr_rom_severe, p50_soc_sev, iqr_soc_severe, p50_sev, iqr_severe,
+           p50_rom_nsev, iqr_rom_nsevere, p50_soc_nsev, iqr_soc_nsevere, p50_nsev, iqr_nsevere)
+  
+  # Use the kable function to build a table that is nice to review
+  kabletable <- kable(data2,
+                      col.names = c("Median", "IQR", "Median", "IQR", "Median", "IQR",
+                                    "Median", "IQR", "Median", "IQR", "Median", "IQR"),
+                      align = "c") %>% 
+    kable_classic() %>% 
+    add_header_above(c("N More Severe Romi" = 2,
+                       "N More Severe SOC" = 2,
+                       "N More Severe" = 2,
+                       "N Less Severe Romi" = 2,
+                       "N Less Severe SOC" = 2,
+                       "N Less Severe" = 2))
+  
+  # Return that kable table at the end of the run.
+  return(kabletable)
+  
+}
+
+```
+
+# Print out the tables
+
+These are only printed for null treatment effects because they are the exact same regardless of effect size. It is only summarizing the N in each cell, which is determined prior to adding the treatment effect.
+
+```{r}
+
+## N = 200
+
+summary(B1)
+
+summary(B2)
+
+summary(B3)
+
+summary(B4)
+
+summary(RB1) # B5
+
+summary(RB3) # B6
+
+## N = 10,000
+
+summary(A1)
+
+summary(A2)
+
+summary(A3)
+
+summary(A4)
+
+summary(RA1) # B5
+
+summary(RA3) # B6
+
+```

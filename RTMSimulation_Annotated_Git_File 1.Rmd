@@ -1,0 +1,1891 @@
+---
+title: "ITP Simulation"
+author: "Chase Latour"
+date: "2/9/2022"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Objective
+
+This document provides annotated code for simulating and analyzing the ITP data in Latour et al. Note that this was done in stages due to revisions. As such, multiple files have been attached.
+
+This is the first file that was used for data generation. You will notice that propensity score models are only built for the individual metrics, not combinations of these metrics. These are amended in the next data generation file.
+
+Note that this all takes a while to run, so we would recommend doing analyses one at a time (i.e., commenting out those you aren't running when you knit the file). You may also considering running this with <2000 simulations at first.
+
+
+```{r include=FALSE}
+
+# Load packages that need
+
+# Call necessary packages
+library(purrr)
+library(furrr)
+future::plan("sequential")
+# Used 'sequential' once the functionality was optimized. However, could use 'multisession' if multiple cores available for processing.
+library(dplyr) 
+library(tidyr)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+
+```
+
+# Restructure
+
+This code was restructured from the original to speed up processing. Specifically, it aims to only simulate the 2,000 simulated sets one-at-a-time so that the code doesn't use as much memory as it runs throughout. This should speed it up and decrease the size of the required machine.
+
+# Functions
+
+Here, I specify the functions that are going to be used in the larger nesting code.
+
+## Simulate 1 dataset
+
+This code is a function that simulates a single dataset. You must specify the following:
+
+* `sim_id`: Indicates which # simulation that data is of the 2,000
+
+* `N`: Total population size
+
+* `fu`: Number of follow-up datapoints per individual
+
+* `p_dist_1`: Proportion of individuals with more-severe ITP (rbinom probability)
+
+* `mean0`: Mean of the platelet distribution for less-severe ITP
+
+* `sd0`: Standard deviation of the platelet distribution for less-severe ITP
+
+* `p0`: Probability of ROM treatment for less-severe ITP
+
+* `mean1`: Mean of the platelet distribution for more-severe ITP
+
+* `sd1`: Standard deviation of the platelet distribution for more-severe ITP
+
+* `p1`: Probability of ROM treatment for more-severe ITP
+
+
+```{r}
+
+# Simulation function
+
+ITPsim <- function(sim_id, N, fu_num, p_dist_1, mean0, sd0, p0, mean1, sd1, p1){
+  
+    # Simulate the overarching dataset
+    tibble(sim_id = sim_id, id = as.integer(1:N)) %>% 
+    # Randomly select individual's underlying severity
+    mutate(severity_n = rbinom(n = N, size = 1, prob = p_dist_1),
+           # Randomly select treatment based on underlying severity
+           treatment_n = rbinom(n = N, size = 1, prob = ifelse(severity_n == 1, p1, p0)),
+           #severity = ifelse(severity_n == 1, "more", "less"),
+           treatment = ifelse(treatment_n == 1, "ROM", "SOC"),
+           treatment_f = factor(treatment_n, levels = c(0,1), labels = c("SOC", "ROM"))) %>%
+    # Sample the platelet counts, based on distribution dictated by underlying severity
+    # pmax ensures that the lowest possible count is 0
+    mutate(platelets = purrr::map(severity_n, ~pmax(0, rnorm(n = fu_num,
+                                                             mean = ifelse(.x==1, mean1, mean0),
+                                                             sd = ifelse(.x==1, sd1, sd0)))),
+           # Gives the sequential follow-up points
+           fu = list(1:fu_num)) %>% 
+    # Record the position of the first platelet value <= 30 that is also after week 8
+    mutate(le30 = purrr::map_int(platelets, function(.x) {
+      # Here, use the brackets to drop the first 8 values from platelets in the ifelse()
+      # However, this changes the index values to re-start at as opposed to starting at 9
+      ifelse(length(which(.x[-c(1:8)] <= 30)) == 0, NA_integer_, which(.x[-c(1:8)] <= 30)[[1]])
+      }),
+      # Need to coerse the value to be back in the correct place because dropped the first 8
+      # positions in the vector prior
+      le30 = le30 + 8) %>% 
+    # Remove numeric version of treatment
+    select(-c(treatment_n)) 
+  
+}
+
+```
+
+## Primary Analyses
+
+This code runs the preliminary analyses on the generated data. Specifically, it generates some of the summary counts and filters out the data points that aren't necessary for later analyses. Finally, propensity score models are built in this function for the 4 summary metrics individually; their associated IPTW weights are calculated.
+
+If want a non-null effect, you would change the `effect` option value to the desired treatment effect (e.g., 50).
+
+```{r}
+
+analysis <- function(dat, effect=0){
+  
+  sim_id <- as.integer(dat$sim_id[1])
+  
+  # Create tibble that is going to contain the summary statistics of the original data
+  summary <- 
+    tibble(sim_id = sim_id,
+           obs_preF = as.double(nrow(dat)))
+  
+  # Edit the generated data  
+  dat %>% 
+    # Remove individuals without an anchor platelet count
+    filter(!is.na(le30)) %>% 
+    # Remove individuals that don't have at least 24 follow-up platelet counts
+    filter(le30 <= 176)
+  
+  summary <- summary %>% 
+    mutate(obs_postF = as.double(nrow(dat)), # Calc number of obs after filtering data
+           
+           # Calculate counts surrounding NPLATE numbers
+           obs_postF_ROM = as.double(nrow(dat[dat$treatment == "ROM",])),
+           obs_postF_ROM_Sev = as.double(nrow(dat[
+             (dat$treatment == "ROM" & dat$severity_n == 1),])),
+           obs_postF_ROM_nSev = as.double(nrow(dat[
+             (dat$treatment == "ROM" & dat$severity_n == 0),])),
+           
+           # Calculate counts surrounding SOC numbers
+           obs_postF_SOC = as.double(nrow(dat[dat$treatment == "SOC",])),
+           obs_postF_SOC_Sev = as.double(nrow(dat[
+             (dat$treatment == "SOC" & dat$severity_n == 1),])),
+           obs_postF_SOC_nSev = as.double(nrow(dat[
+             (dat$treatment == "SOC" & dat$severity_n == 0),])))
+  
+  # Edit the generated data further - remove the platelet count values not in the   
+    # accepted follow-up range (8 weeks prior to anchor and 24 weeks after anchor).
+  dat <- dat %>% 
+    unnest(c(platelets, fu)) %>% 
+    filter(fu >= le30 - 8 & fu <= le30 + 24) %>% 
+    # Add in the treatment effect to the platelet counts from the ROM group - Done before other
+      # analyses that rely on these counts
+    mutate(platelets = ifelse(fu > le30 + 1 & treatment == "ROM",
+                              platelets + effect,
+                              platelets))
+  
+  # Calculate summary statistics of measures prior to anchor - over all of the individuals in 
+    #each dataset
+  summary <- summary %>% 
+          
+          # Calculate the mean of the platelet counts prior to anchoring event for ROM & SOC
+            # groups - over all of the individuals in the dataset
+    mutate(pre_mean_ROM = mean(dat$platelets[dat$fu < dat$le30 & dat$treatment == "ROM"]),
+           pre_mean_SOC = mean(dat$platelets[dat$fu < dat$le30 & dat$treatment == "SOC"]),
+           
+           #Calculate the std dev of the platelet counts prior to anchoring event for ROM & SOC
+           # groups - over all of the individuals in each datasets
+           pre_sd_ROM = sd(dat$platelets[dat$fu < dat$le30 & dat$treatment == "ROM"]),
+           pre_sd_SOC = sd(dat$platelets[dat$fu < dat$le30 & dat$treatment == "SOC"]),
+           
+           #Calculate the mean of the platelet counts after the anchoring event for ROM & SOC 
+           # groups
+           post_mean_ROM = mean(dat$platelets[dat$fu > dat$le30 + 1 & dat$treatment == "ROM"]),
+           post_mean_SOC = mean(dat$platelets[dat$fu > dat$le30 + 1 & dat$treatment == "SOC"]),
+           
+           #Calculate the sd of the platelet counts after the anchoring event for ROM & SOC 
+           # groups
+           post_sd_ROM = sd(dat$platelets[dat$fu > dat$le30 + 1 & dat$treatment == "ROM"]),
+           post_sd_SOC = sd(dat$platelets[dat$fu > dat$le30 + 1 & dat$treatment == "SOC"]))
+  
+  # Calculate individual-level means, medians & sds before the anchoring event (le30)
+    # Additionally calculate the difference in most recent count and anchor, and
+    # Absolute largest difference between most recent count
+  dat <- dat %>%
+    group_by(id) %>% 
+    summarise(sim_id, id, severity_n, treatment, treatment_f, platelets, fu, le30, 
+            ind_pre_mean = as.double(mean(platelets[fu < le30])),
+            ind_pre_sd = as.double(sd(platelets[fu < le30])),
+            ind_pre_med = as.double(median(platelets[fu < le30])),
+            diff_most_recent = platelets[fu == le30 - 1] - platelets[fu == le30],
+            diff_largest = (max(platelets[fu < le30]) - platelets[fu == le30]),
+            .groups = "keep") %>% 
+    nest(counts = c(platelets, fu))
+  
+  
+  # Calculate the propensity scores separately because it's faster this way than 
+    # nesting in a summarize or mutate function
+  # They stay ordered from how they were generated and thus can easily be added into 
+    # the original data.
+  # PS based on prior count
+  ps_meanRTM_dat <- as.vector(predict(glm(treatment_f ~ ind_pre_mean,
+                                      data = dat,
+                                      family = binomial()),
+                                  type = "response"))
+  
+  ps_goldstd_dat <- as.vector(predict(glm(treatment_f ~ severity_n,
+                                      data = dat,
+                                      family = binomial()),
+                                  type = "response"))
+  
+  ps_sdRTM_dat <- as.vector(predict(glm(treatment_f ~ ind_pre_sd,
+                                      data = dat,
+                                      family = binomial()),
+                                  type = "response"))
+  
+  ps_recentdiffRTM_dat <- as.vector(predict(glm(treatment_f ~ diff_most_recent,
+                                      data = dat,
+                                      family = binomial()),
+                                  type = "response"))
+  
+  ps_largediffRTM_dat <- as.vector(predict(glm(treatment_f ~ diff_largest,
+                                      data = dat,
+                                      family = binomial()),
+                                  type = "response"))
+  
+  # Merge the newly created propensity scores and calculate the associated weights.
+  
+  summary2 <- 
+    left_join(dat, summary, by = c("sim_id"))
+  
+  # Calculate the weights
+  summary2 <- summary2 %>% 
+    ungroup() %>% 
+    mutate(ps_meanRTM = as.double(ps_meanRTM_dat),
+           ps_meanRTMw = ifelse(treatment == "ROM",
+                                1/ps_meanRTM,
+                                1/(1-ps_meanRTM)),
+           
+           ps_goldstd = as.double(ps_goldstd_dat),
+           ps_goldstdw = ifelse(treatment == "ROM",
+                               1/ps_goldstd,
+                               1/(1-ps_goldstd)),
+           
+           ps_sdRTM = as.double(ps_sdRTM_dat),
+           ps_sdRTMw = ifelse(treatment == "ROM",
+                               1/ps_sdRTM,
+                               1/(1-ps_sdRTM)),
+           
+           ps_recentdiffRTM = as.double(ps_recentdiffRTM_dat),
+           ps_rdiffRTMw = ifelse(treatment == "ROM",
+                               1/ps_recentdiffRTM,
+                               1/(1-ps_recentdiffRTM)),
+           
+           ps_largediffRTM = as.double(ps_largediffRTM_dat),
+           ps_ldiffRTMw = ifelse(treatment == "ROM",
+                               1/ps_largediffRTM,
+                               1/(1-ps_largediffRTM)))
+    
+  # Return the dataset that we want.
+  return(summary2)
+  
+}
+
+```
+
+# Functions for Median Platelet Count
+
+This function implements the median platelet count estimator for each treatment group. For the real-world data analysis, we calculated the median platelet count using a grid-search algorithm. However, in this we replaced the grid search with the optimize function. The grid search was incredibly slow and unreasonable to run on our machines.
+
+```{r}
+
+mpr_point <- function(flat, psweight){
+  
+  # Create a dataset where each row represents a week - thus, one platelet count per row.
+  week <- flat %>% 
+    unnest(cols = counts) %>% 
+  # Filter to platelet counts from weeks 2 through 24 after follow-up
+    filter(fu > le30 + 1) 
+  
+  # Calculate max values so that optimize function can run without failure - needs a reasonable range
+  max_ROM <- max(week$platelets[week$treatment == "ROM"])
+  max_SOC <- max(week$platelets[week$treatment == "SOC"])
+  
+  # Gets the number of participants in the dataset
+  nn <- nrow(flat)
+  
+  # Create the function that will be run through the root finder - ROMISPLOTIM
+  solve_this_ROM <- function(x){
+    week %>%
+      group_by(id) %>%
+      dplyr::summarize(
+        Y1 = sum( I(platelets < x)) , # Divide by 23 because there are 23 fu platelet counts
+        .groups = "drop"
+      ) %>%
+      left_join(flat, by = "id") %>%
+      dplyr::summarize(
+        `1` = abs(0.5 - (sum( Y1 * I(treatment == "ROM") * psweight ) / (23*nn))),
+        .groups = "drop"
+      ) %>%
+      tidyr::gather(
+        key = "treatment", value = "estimate"
+      ) %>%
+      pull(estimate)
+  }
+  
+  # Create the function that will be run through the root finder - SOC
+  solve_this_SOC <- function(x){
+    week %>%
+      group_by(id) %>%
+      dplyr::summarize(
+        Y2 = sum( I(platelets < x)),
+        .groups = "drop"
+      ) %>%
+      left_join(flat, by = "id") %>%
+      dplyr::summarize(
+        `0` = abs(0.5 - (sum( Y2 * I(treatment == "SOC") * psweight ) / (23*nn))),
+        .groups = "drop"
+      ) %>%
+      tidyr::gather(
+        key = "treatment", value = "estimate"
+      ) %>%
+      pull(estimate)
+  }
+  
+  values_ROM <- optimize(solve_this_ROM, c(0,max_ROM))$minimum
+  values_SOC <- optimize(solve_this_SOC, c(0,max_SOC))$minimum
+  
+  # Rounding values to 10 decimals due to numerical instability
+  tibble(
+    `1` = round(as.double(values_ROM), 10),
+    `0` = round(as.double(values_SOC), 10)
+  ) %>%
+    mutate(
+      `1-0` = `1` - `0`
+    ) %>%
+    tidyr::gather(
+      key = "treatment", value = "estimate"
+    ) %>%
+    mutate(
+      target    = c("Y(a)", "Y(a)", "RD"),
+      estimator = "median_estimator",
+      outcome   = "outcome_median_platelet_response",
+      t         = 24L*7L - 1L
+    )
+  
+}
+
+
+```
+
+This function actually applies the `mpr_point()` function above and then runs the final analyses to calculate the difference between the median platelet counts of the two treatment groups.
+
+```{r}
+
+# This function uses the mpr_point() function built above to calculate the adjusted median platelet counts based upon the different RTM measures. This will be applied to each of the datasets after the analysis() function is run.
+
+# Each variable calculated adds a column to the dataset that contains a tibble with the desired information.
+
+
+analysis2 <- function(dataset) {
+  
+  dataset <- dataset %>% 
+    
+      # Nest the individual-level patient data so that can store the tibble in the dataset
+    nest(data = c(id, severity_n, treatment, treatment_f, le30, ind_pre_mean, ind_pre_sd,
+                  ind_pre_med, diff_most_recent, diff_largest, counts, ps_meanRTM, ps_meanRTMw,
+                  ps_goldstd, ps_goldstdw, ps_sdRTM, ps_sdRTMw, ps_largediffRTM, ps_ldiffRTMw, 
+                  ps_recentdiffRTM, ps_rdiffRTMw)) %>% 
+    
+    # Calculate the median estimates - First ones calculated without PS adjustment
+    mutate(median_noPS = furrr::future_map(data, ~mpr_point(.x, 1),
+                                          .options = future_options(seed = TRUE)),
+           md_noPS = furrr::future_map(median_noPS,
+                                       ~as.double(.x$estimate[.x$treatment == '1-0']),
+                                          .options = future_options(seed = TRUE)),
+           
+           # Calculate median with gold-standard adjustment
+           out_psgold = furrr::future_map(data, ~mpr_point(.x, .x$ps_goldstdw),
+                                          .options = future_options(seed = TRUE)),
+           # Print median difference in dataset
+           md_PSgold = furrr::future_map(out_psgold,
+                                         ~as.double(.x$estimate[.x$treatment == '1-0']),
+                                          .options = future_options(seed = TRUE)),
+             
+           # Calculate median adjusted for mean prior platelet count
+           out_psmean = furrr::future_map(data, ~mpr_point(.x, .x$ps_meanRTMw),
+                                          .options = future_options(seed = TRUE)),
+           # Print median difference in dataset
+           md_PSmean = furrr::future_map(out_psmean,
+                                         ~as.double(.x$estimate[.x$treatment == '1-0']),
+                                         .options = future_options(seed = TRUE)),
+             
+           # Calculate median adjusted for sd of prior platelet count
+           out_pssd = furrr::future_map(data, ~mpr_point(.x, .x$ps_sdRTMw),
+                                        .options = future_options(seed = TRUE)),
+           # Print median difference in dataset
+           md_PSsd = furrr::future_map(out_pssd,
+                                       ~as.double(.x$estimate[.x$treatment == '1-0']),
+                                       .options = future_options(seed = TRUE)),
+             
+           # Calculate median adjusted for most recent difference of prior platelet count
+           out_rdiff = furrr::future_map(data, ~mpr_point(.x, .x$ps_rdiffRTMw),
+                                         .options = future_options(seed = TRUE)),
+           # Print median difference in dataset
+           md_PSrdiff = furrr::future_map(out_rdiff,
+                                          ~as.double(.x$estimate[.x$treatment == '1-0']),
+                                          .options = future_options(seed = TRUE)),
+           
+           # Calculate median adjusted for largest prior platelet count difference
+           out_ldiff = furrr::future_map(data, ~mpr_point(.x, .x$ps_ldiffRTMw),
+                                         .options = future_options(seed = TRUE)),
+           # Print median difference in dataset
+           md_PSldiff = furrr::future_map(out_ldiff,
+                                          ~as.double(.x$estimate[.x$treatment == '1-0']),
+                                          .options = future_options(seed = TRUE)))
+    
+  return(dataset)
+
+}
+
+
+```
+
+# Simulate 1 dataset:
+
+Create a function that simulates 1 dataset of n patients. This will be iterated over with the above functions using `furrr` functionality below.
+
+```{r eval=FALSE}
+
+sim_one <- function(sim_id, N, fu_num, p_dist_1, mean0, sd0, p0, mean1, sd1, p1){
+  
+  A <- ITPsim(sim_id, N, fu_num, p_dist_1, mean0, sd0, p0, mean1, sd1, p1)
+  
+  A2 <- analysis(A, effect=0)
+  
+  A3 <- analysis2(A2)
+  
+  return(A3)
+  
+}
+
+# Function with effect=50
+
+sim_one50 <- function(sim_id, N, fu_num, p_dist_1, mean0, sd0, p0, mean1, sd1, p1){
+  
+  A <- ITPsim(sim_id, N, fu_num, p_dist_1, mean0, sd0, p0, mean1, sd1, p1)
+  
+  A2 <- analysis(A, effect=0)
+  
+  A3 <- analysis2(A2)
+  
+  return(A3)
+  
+}
+
+```
+
+# Simulate Datasets
+
+This code simulates and runs preliminary analyses on 2,000 datasets per parameter specification. This is stored in a nested dataset where each dataset is nested within a simulation ID.
+
+Here, you have to specify the number of simulations that you would like to run manually - as the `sim` variable. This is manual so that we could test the code with less simulations for testing. **This is recommended because it is slow.**
+
+Note that this takes a very long time. I would suggest generating one dataset at a time, as opposed to all in one Knit.
+
+```{r eval=FALSE}
+
+# Set the seed for all of the simulations
+set.seed(as.integer(923857))
+
+# Simulate 2,000 datasets - Currently set as 1 takes hours to run.
+sim <- 2000
+
+# N = 10,0000; Differential RTM results
+
+A1 <- furrr::future_map_dfr(1:sim, sim_one, N = 10000, fu_num = 200, p_dist_1 = 0.5,
+                            mean0 = 100, sd0 = 50, p0 = 0.4, mean1 = 40, sd1 = 15,
+                            p1 = 0.6, .options = future_options(seed = TRUE))
+saveRDS(A1, file = "Simulated R Data/A1_all.rds")
+
+A2 <- furrr::future_map_dfr(1:sim, sim_one, N = 10000, fu_num = 200, p_dist_1 = 0.5,
+                            mean0 = 100, sd0 = 50, p0 = 0.2, mean1 = 40, sd1 = 15,
+                            p1 = 0.8, .options = future_options(seed = TRUE))
+saveRDS(A2, file = "Simulated R Data/A2_all.rds")
+
+A3 <- furrr::future_map_dfr(1:sim, sim_one, N = 10000, fu_num = 200, p_dist_1 = 0.5,
+                                     mean0 = 55, sd0 = 20, p0 = 0.4, mean1 = 35, sd1 = 10,
+                                     p1 = 0.6, .options = future_options(seed = TRUE))
+saveRDS(A3, file = "Simulated R Data/A3_all.rds")
+
+A4 <- furrr::future_map_dfr(1:sim, sim_one, N = 10000, fu_num = 200, p_dist_1 = 0.5,
+                                    mean0 = 55, sd0 = 20, p0 = 0.2, mean1 = 35, sd1 = 10,
+                                    p1 = 0.8, .options = future_options(seed = TRUE))
+saveRDS(A4, file = "Simulated R Data/A4_all.rds")
+
+
+
+# N = 10,000, RCT Results
+
+RA1 <- furrr::future_map_dfr(1:sim, sim_one, N = 10000, fu_num = 200, p_dist_1 = 0.5,
+                                      mean0 = 100, sd0 = 50, p0 = 0.5, mean1 = 40, sd1 = 15,
+                                      p1 = 0.5, .options = future_options(seed = TRUE))
+saveRDS(RA1, file = "Simulated R Data/RA1_all.rds")
+
+RA3 <- furrr::future_map_dfr(1:sim, sim_one, N = 10000, fu_num = 200, p_dist_1 = 0.5,
+                                      mean0 = 55, sd0 = 20, p0 = 0.5, mean1 = 35, sd1 = 10,
+                                      p1 = 0.5, .options = future_options(seed = TRUE))
+saveRDS(RA3, file = "Simulated R Data/RA3_all.rds")
+
+
+
+# N = 200; Differential RTM Results 
+
+B1 <- furrr::future_map_dfr(1:sim, sim_one, N = 200, fu_num = 200, p_dist_1 = 0.5,
+                                     mean0 = 100, sd0 = 50, p0 = 0.4, mean1 = 40, sd1 = 15,
+                                     p1 =0.6, .options = future_options(seed = TRUE))
+saveRDS(B1, file = "Simulated R Data/B1_all.rds")
+
+B2 <- furrr::future_map_dfr(1:sim, sim_one, N = 200, fu_num = 200, p_dist_1 = 0.5,
+                                     mean0 = 100, sd0 = 50, p0 = 0.2, mean1 = 40, sd1 = 15,
+                                     p1 = 0.8, .options = future_options(seed = TRUE))
+saveRDS(B2, file = "Simulated R Data/B2_all.rds")
+
+B3 <- furrr::future_map_dfr(1:sim, sim_one, N = 200, fu_num = 200, p_dist_1 = 0.5,
+                                     mean0 = 55, sd0 = 20, p0 = 0.4, mean1 = 35, sd1 = 10,
+                                     p1 = 0.6, .options = future_options(seed = TRUE))
+saveRDS(B3, file = "Simulated R Data/B3_all.rds")
+
+B4 <- furrr::future_map_dfr(1:sim, sim_one, N = 200, fu_num = 200, p_dist_1 = 0.5,
+                                     mean0 = 55, sd0 = 20, p0 = 0.2, mean1 = 35, sd1 = 10,
+                                     p1 = 0.8, .options = future_options(seed = TRUE))
+saveRDS(B4, file = "Simulated R Data/B4_all.rds")
+
+
+# N = 200, RCT Results
+
+R1 <- furrr::future_map_dfr(1:sim, sim_one, N = 200, fu_num = 200, p_dist_1 = 0.5,
+                                     mean0 = 100, sd0 = 50, p0 = 0.5, mean1 = 40, sd1 = 15,
+                                     p1 = 0.5, .options = future_options(seed = TRUE))
+saveRDS(R1, file = "Simulated R Data/R1_all.rds")
+
+R3 <- furrr::future_map_dfr(1:sim, sim_one, N = 200, fu_num = 200, p_dist_1 = 0.5,
+                                     mean0 = 55, sd0 = 20, p0 = 0.5, mean1 = 35, sd1 = 10,
+                                     p1 = 0.5, .options = future_options(seed = TRUE))
+saveRDS(R3, file = "Simulated R Data/R3_all.rds")
+
+
+
+
+#################
+
+# Non-null effect estimates
+
+
+
+# N = 10,0000; Differential RTM results
+
+A150 <- furrr::future_map_dfr(1:sim, sim_one50, N = 10000, fu_num = 200, p_dist_1 = 0.5,
+                            mean0 = 100, sd0 = 50, p0 = 0.4, mean1 = 40, sd1 = 15,
+                            p1 = 0.6, .options = future_options(seed = TRUE))
+saveRDS(A150, file = "Simulated R Data/A1_all50.rds")
+
+A250 <- furrr::future_map_dfr(1:sim, sim_one50, N = 10000, fu_num = 200, p_dist_1 = 0.5,
+                            mean0 = 100, sd0 = 50, p0 = 0.2, mean1 = 40, sd1 = 15,
+                            p1 = 0.8, .options = future_options(seed = TRUE))
+saveRDS(A250, file = "Simulated R Data/A2_all50.rds")
+
+A350 <- furrr::future_map_dfr(1:sim, sim_one50, N = 10000, fu_num = 200, p_dist_1 = 0.5,
+                                     mean0 = 55, sd0 = 20, p0 = 0.4, mean1 = 35, sd1 = 10,
+                                     p1 = 0.6, .options = future_options(seed = TRUE))
+saveRDS(A350, file = "Simulated R Data/A3_all50.rds")
+
+A450 <- furrr::future_map_dfr(1:sim, sim_one50, N = 10000, fu_num = 200, p_dist_1 = 0.5,
+                                    mean0 = 55, sd0 = 20, p0 = 0.2, mean1 = 35, sd1 = 10,
+                                    p1 = 0.8, .options = future_options(seed = TRUE))
+saveRDS(A450, file = "Simulated R Data/A4_all50.rds")
+
+
+
+# N = 10,000, RCT Results
+
+RA150 <- furrr::future_map_dfr(1:sim, sim_one50, N = 10000, fu_num = 200, p_dist_1 = 0.5,
+                                      mean0 = 100, sd0 = 50, p0 = 0.5, mean1 = 40, sd1 = 15,
+                                      p1 = 0.5, .options = future_options(seed = TRUE))
+saveRDS(RA150, file = "Simulated R Data/RA1_all50.rds")
+
+RA350 <- furrr::future_map_dfr(1:sim, sim_one50, N = 10000, fu_num = 200, p_dist_1 = 0.5,
+                                      mean0 = 55, sd0 = 20, p0 = 0.5, mean1 = 35, sd1 = 10,
+                                      p1 = 0.5, .options = future_options(seed = TRUE))
+saveRDS(RA350, file = "Simulated R Data/RA3_all50.rds")
+
+
+
+# N = 200; Differential RTM Results 
+
+B150 <- furrr::future_map_dfr(1:sim, sim_one50, N = 200, fu_num = 200, p_dist_1 = 0.5,
+                                     mean0 = 100, sd0 = 50, p0 = 0.4, mean1 = 40, sd1 = 15,
+                                     p1 =0.6, .options = future_options(seed = TRUE))
+saveRDS(B150, file = "Simulated R Data/B1_all50.rds")
+
+B250 <- furrr::future_map_dfr(1:sim, sim_one50, N = 200, fu_num = 200, p_dist_1 = 0.5,
+                                     mean0 = 100, sd0 = 50, p0 = 0.2, mean1 = 40, sd1 = 15,
+                                     p1 = 0.8, .options = future_options(seed = TRUE))
+saveRDS(B250, file = "Simulated R Data/B2_all50.rds")
+
+B350 <- furrr::future_map_dfr(1:sim, sim_one50, N = 200, fu_num = 200, p_dist_1 = 0.5,
+                                     mean0 = 55, sd0 = 20, p0 = 0.4, mean1 = 35, sd1 = 10,
+                                     p1 = 0.6, .options = future_options(seed = TRUE))
+saveRDS(B350, file = "Simulated R Data/B3_all50.rds")
+
+B450 <- furrr::future_map_dfr(1:sim, sim_one50, N = 200, fu_num = 200, p_dist_1 = 0.5,
+                                     mean0 = 55, sd0 = 20, p0 = 0.2, mean1 = 35, sd1 = 10,
+                                     p1 = 0.8, .options = future_options(seed = TRUE))
+saveRDS(B450, file = "Simulated R Data/B4_all50.rds")
+
+
+# N = 200, RCT Results
+
+R150 <- furrr::future_map_dfr(1:sim, sim_one50, N = 200, fu_num = 200, p_dist_1 = 0.5,
+                                     mean0 = 100, sd0 = 50, p0 = 0.5, mean1 = 40, sd1 = 15,
+                                     p1 = 0.5, .options = future_options(seed = TRUE))
+saveRDS(R150, file = "Simulated R Data/R1_all50.rds")
+
+R350 <- furrr::future_map_dfr(1:sim, sim_one50, N = 200, fu_num = 200, p_dist_1 = 0.5,
+                                     mean0 = 55, sd0 = 20, p0 = 0.5, mean1 = 35, sd1 = 10,
+                                     p1 = 0.5, .options = future_options(seed = TRUE))
+saveRDS(R350, file = "Simulated R Data/R3_all50.rds")
+
+
+
+
+
+```
+
+# Describe Simulated Platelet Counts
+
+The code below generates a Table 1 for the simulated data platelet counts - one table for each starting sample size (N = 10,000; N = 200).
+
+## Table Functions
+
+The functions below create the summary tables to describe the simulated data. Note that we had to run these all iteratively, commenting out unnecessary code for each smaller run. We could not run this over all of the datasets at once because it was too computationally-intensive.
+
+```{r}
+
+# Function to get what need from each dataset
+
+kable_table_ROM <- function(dataset){
+  dataset %>% 
+    mutate(data = furrr::future_map(data, ~.x %>% filter(treatment == "ROM"))) %>% 
+    ungroup() %>% 
+    select(obs_postF_ROM, obs_postF_ROM_Sev, obs_postF_ROM_nSev, pre_mean_ROM, 
+           pre_sd_ROM, post_mean_ROM, post_sd_ROM) %>% 
+    summarize(treatment = "ROM",
+              med_n = round(median(as.double(obs_postF_ROM)),2), 
+              qrt1_n = round(quantile(as.double(obs_postF_ROM), probs = 0.25), 2), 
+              qrt3_n = round(quantile(as.double(obs_postF_ROM), probs = 0.75), 2),
+              med_n_Sev = round(median(as.double(obs_postF_ROM_Sev)),2), 
+              qrt1_n_Sev = round(quantile(as.double(obs_postF_ROM_Sev), probs = 0.25), 2), 
+              qrt3_n_Sev = round(quantile(as.double(obs_postF_ROM_Sev), probs = 0.75), 2),
+              med_n_nSev = round(median(as.double(obs_postF_ROM_nSev)),2), 
+              qrt1_n_nSev = round(quantile(as.double(obs_postF_ROM_nSev), probs = 0.25), 2), 
+              qrt3_n_nSev = round(quantile(as.double(obs_postF_ROM_nSev), probs = 0.75), 2),
+              med_pre_mean = round(median(pre_mean_ROM), 2),
+              qrt1_pre_mean = round(quantile(pre_mean_ROM, probs = 0.25), 2),
+              qrt3_pre_mean = round(quantile(pre_mean_ROM, probs = 0.75), 2),
+              med_pre_sd = round(median(pre_sd_ROM),2),
+              qrt1_pre_sd = round(quantile(pre_sd_ROM, probs = 0.25), 2),
+              qrt3_pre_sd = round(quantile(pre_sd_ROM, probs = 0.75), 2),
+              med_post_mean = round(median(post_mean_ROM), 2),
+              qrt1_post_mean = round(quantile(post_mean_ROM, probs = 0.25), 2),
+              qrt3_post_mean = round(quantile(post_mean_ROM, probs = 0.75), 2),
+              med_post_sd = round(median(post_sd_ROM), 2),
+              qrt1_post_sd = round(quantile(post_sd_ROM, probs = 0.25), 2),
+              qrt3_post_sd = round(quantile(post_sd_ROM, probs = 0.75), 2),
+              .groups = "drop")
+}
+
+kable_table_SOC <- function(dataset) {
+  dataset %>% 
+    mutate(data = furrr::future_map(data, ~.x %>% filter(treatment == "SOC"))) %>% 
+    ungroup() %>% 
+    select(obs_postF_SOC, obs_postF_SOC_Sev, obs_postF_SOC_nSev, pre_mean_SOC, 
+           pre_sd_SOC, post_mean_SOC, post_sd_SOC) %>% 
+    summarize(treatment = "SOC",
+              med_n = round(median(as.double(obs_postF_SOC)),2), 
+              qrt1_n = round(quantile(as.double(obs_postF_SOC), probs = 0.25), 2), 
+              qrt3_n = round(quantile(as.double(obs_postF_SOC), probs = 0.75), 2),
+              med_n_Sev = round(median(as.double(obs_postF_SOC_Sev)),2), 
+              qrt1_n_Sev = round(quantile(as.double(obs_postF_SOC_Sev), probs = 0.25), 2), 
+              qrt3_n_Sev = round(quantile(as.double(obs_postF_SOC_Sev), probs = 0.75), 2),
+              med_n_nSev = round(median(as.double(obs_postF_SOC_nSev)),2), 
+              qrt1_n_nSev = round(quantile(as.double(obs_postF_SOC_nSev), probs = 0.25), 2), 
+              qrt3_n_nSev = round(quantile(as.double(obs_postF_SOC_nSev), probs = 0.75), 2),
+              med_pre_mean = round(median(pre_mean_SOC), 2),
+              qrt1_pre_mean = round(quantile(pre_mean_SOC, probs = 0.25), 2),
+              qrt3_pre_mean = round(quantile(pre_mean_SOC, probs = 0.75), 2),
+              med_pre_sd = round(median(pre_sd_SOC),2),
+              qrt1_pre_sd = round(quantile(pre_sd_SOC, probs = 0.25), 2),
+              qrt3_pre_sd = round(quantile(pre_sd_SOC, probs = 0.75), 2),
+              med_post_mean = round(median(post_mean_SOC), 2),
+              qrt1_post_mean = round(quantile(post_mean_SOC, probs = 0.25), 2),
+              qrt3_post_mean = round(quantile(post_mean_SOC, probs = 0.75), 2),
+              med_post_sd = round(median(post_sd_SOC), 2),
+              qrt1_post_sd = round(quantile(post_sd_SOC, probs = 0.25), 2),
+              qrt3_post_sd = round(quantile(post_sd_SOC, probs = 0.75), 2),
+              .groups = "drop")
+}
+
+```
+
+## N = 10,000
+
+### Null Effect
+
+```{r}
+
+# Simulate the tables for each scenario
+
+## Scenario A1
+sceA1_ROM <- kable_table_ROM(A1)
+sceA1_SOC <- kable_table_SOC(A1)
+## Scenario A2
+sceA2_ROM <- kable_table_ROM(A2)
+sceA2_SOC <- kable_table_SOC(A2)
+## Scenario A3
+sceA3_ROM <- kable_table_ROM(A3)
+sceA3_SOC <- kable_table_SOC(A3)
+## Scenario A4
+sceA4_ROM <- kable_table_ROM(A4)
+sceA4_SOC <- kable_table_SOC(A4)
+
+
+# Create the table
+tableA_null <- rbind(sceA1_ROM, sceA1_SOC, sceA2_ROM, sceA2_SOC, 
+                     sceA3_ROM, sceA3_SOC, sceA4_ROM, sceA4_SOC)
+
+# Use kable to print the table
+kable(tableA_null,
+      col.names = c("", "Median", "Q1", "Q3", "Median", "Q1", "Q3", "Median", "Q1", "Q3", "Median",
+                    "Q1", "Q3", "Median", "Q1", "Q3", "Median", "Q1", "Q3", "Median", "Q1", "Q3"),
+      align = 'c') %>% 
+  kable_classic() %>% 
+  #kable_paper("striped", full_width = F) %>%
+  add_header_above(c(" " = 1, "N After Anchor Event Exclusion Criteria" = 3,
+                     "N with Severe Underlying ITP" = 3,
+                     "N with Less-Severe Underlying ITP" = 3,
+                     "Mean of Platelet Counts Prior to Anchor" = 3, 
+                     "SD of Platelet Counts Prior to Anchor" = 3, 
+                     "Mean of Platelet Counts After Anchor " = 3, 
+                     "SD of Platelet Counts After Anchor" = 3)) %>% 
+  pack_rows("Scenario A1", 1, 2) %>%
+  pack_rows("Scenario A2", 3, 4) %>% 
+  pack_rows("Scenario A3", 5, 6) %>% 
+  pack_rows("Scenario A4", 7, 8) %>% 
+  footnote(general = "Mean and Standard Deviation values for platelet counts are calculated over all simulations within a specific scenario and treatment group.")
+
+```
+
+
+### Non-Null Effect
+
+```{r}
+
+# Simulate the tables for each scenario
+
+## Scenario A1
+sceA1_ROM <- kable_table_ROM(A150)
+sceA1_SOC <- kable_table_SOC(A150)
+## Scenario A2
+sceA2_ROM <- kable_table_ROM(A250)
+sceA2_SOC <- kable_table_SOC(A250)
+## Scenario A3
+sceA3_ROM <- kable_table_ROM(A350)
+sceA3_SOC <- kable_table_SOC(A350)
+## Scenario A4
+sceA4_ROM <- kable_table_ROM(A450)
+sceA4_SOC <- kable_table_SOC(A450)
+
+
+# Create the table
+tableA_null <- rbind(sceA1_ROM, sceA1_SOC, sceA2_ROM, sceA2_SOC, 
+                     sceA3_ROM, sceA3_SOC, sceA4_ROM, sceA4_SOC)
+
+# Use kable to print the table
+kable(tableA_null,
+      col.names = c("", "Median", "Q1", "Q3", "Median", "Q1", "Q3", "Median", "Q1", "Q3", "Median",
+                    "Q1", "Q3", "Median", "Q1", "Q3", "Median", "Q1", "Q3", "Median", "Q1", "Q3"),
+      align = 'c') %>% 
+  kable_classic() %>% 
+  #kable_paper("striped", full_width = F) %>%
+  add_header_above(c(" " = 1, "N After Anchor Event Exclusion Criteria" = 3,
+                     "N with Severe Underlying ITP" = 3,
+                     "N with Less-Severe Underlying ITP" = 3,
+                     "Mean of Platelet Counts Prior to Anchor" = 3, 
+                     "SD of Platelet Counts Prior to Anchor" = 3, 
+                     "Mean of Platelet Counts After Anchor " = 3, 
+                     "SD of Platelet Counts After Anchor" = 3)) %>% 
+  pack_rows("Scenario A1", 1, 2) %>%
+  pack_rows("Scenario A2", 3, 4) %>% 
+  pack_rows("Scenario A3", 5, 6) %>% 
+  pack_rows("Scenario A4", 7, 8) %>% 
+  footnote(general = "Mean and Standard Deviation values for platelet counts are calculated over all simulations within a specific scenario and treatment group.")
+
+```
+
+
+
+## N = 10,000; RCT Results
+
+### Null Effect
+
+```{r}
+
+# Simulate the tables for each scenario
+
+## Scenario RA1
+sceRA1_ROM <- kable_table_ROM(RA1)
+sceRA1_SOC <- kable_table_SOC(RA1)
+## Scenario RA3
+sceRA3_ROM <- kable_table_ROM(RA3)
+sceRA3_SOC <- kable_table_SOC(RA3)
+
+
+# Create the table
+tableRA_null <- rbind(sceRA1_ROM, sceRA1_SOC, 
+                      sceRA3_ROM, sceRA3_SOC)
+
+# Use kable to print the table
+kable(tableRA_null,
+      col.names = c("", "Median", "Q1", "Q3", "Median", "Q1", "Q3", "Median", "Q1", "Q3", "Median",
+                    "Q1", "Q3", "Median", "Q1", "Q3", "Median", "Q1", "Q3", "Median", "Q1", "Q3"),
+      align = 'c') %>% 
+  kable_classic() %>% 
+  #kable_paper("striped", full_width = F) %>%
+  add_header_above(c(" " = 1, "N After Anchor Event Exclusion Criteria" = 3,
+                     "N with Severe Underlying ITP" = 3,
+                     "N with Less-Severe Underlying ITP" = 3,
+                     "Mean of Platelet Counts Prior to Anchor" = 3, 
+                     "SD of Platelet Counts Prior to Anchor" = 3, 
+                     "Mean of Platelet Counts After Anchor " = 3, 
+                     "SD of Platelet Counts After Anchor" = 3)) %>% 
+  pack_rows("Scenario RA1", 1, 2) %>%
+  pack_rows("Scenario RA3", 3, 4) %>%
+  footnote(general = "Mean and Standard Deviation values for platelet counts are calculated over all simulations within a specific scenario and treatment group.")
+
+```
+
+
+### Non-Null Effect
+
+```{r}
+
+# Simulate the tables for each scenario
+
+## Scenario RA1
+sceRA1_ROM <- kable_table_ROM(RA150)
+sceRA1_SOC <- kable_table_SOC(RA150)
+## Scenario RA3
+sceRA3_ROM <- kable_table_ROM(RA350)
+sceRA3_SOC <- kable_table_SOC(RA350)
+
+
+# Create the table
+tableRA_null <- rbind(sceRA1_ROM, sceRA1_SOC, 
+                      sceRA3_ROM, sceRA3_SOC)
+
+# Use kable to print the table
+kable(tableRA_null,
+      col.names = c("", "Median", "Q1", "Q3", "Median", "Q1", "Q3", "Median", "Q1", "Q3", "Median",
+                    "Q1", "Q3", "Median", "Q1", "Q3", "Median", "Q1", "Q3", "Median", "Q1", "Q3"),
+      align = 'c') %>% 
+  kable_classic() %>% 
+  #kable_paper("striped", full_width = F) %>%
+  add_header_above(c(" " = 1, "N After Anchor Event Exclusion Criteria" = 3,
+                     "N with Severe Underlying ITP" = 3,
+                     "N with Less-Severe Underlying ITP" = 3,
+                     "Mean of Platelet Counts Prior to Anchor" = 3, 
+                     "SD of Platelet Counts Prior to Anchor" = 3, 
+                     "Mean of Platelet Counts After Anchor " = 3, 
+                     "SD of Platelet Counts After Anchor" = 3)) %>% 
+  pack_rows("Scenario RA1", 1, 2) %>%
+  pack_rows("Scenario RA3", 3, 4) %>%
+  footnote(general = "Mean and Standard Deviation values for platelet counts are calculated over all simulations within a specific scenario and treatment group.")
+
+```
+
+
+## N = 200
+
+### Null Effect
+
+```{r}
+
+# Simulate the tables for each scenario
+
+## Scenario B1
+sceB1_ROM <- kable_table_ROM(B1)
+sceB1_SOC <- kable_table_SOC(B1)
+## Scenario B2
+sceB2_ROM <- kable_table_ROM(B2)
+sceB2_SOC <- kable_table_SOC(B2)
+## Scenario B3
+sceB3_ROM <- kable_table_ROM(B3)
+sceB3_SOC <- kable_table_SOC(B3)
+## Scenario B4
+sceB4_ROM <- kable_table_ROM(B4)
+sceB4_SOC <- kable_table_SOC(B4)
+
+
+# Create the table
+tableB_null <- rbind(sceB1_ROM, sceB1_SOC)#, sceB2_ROM, sceB2_SOC, 
+                     #sceB3_ROM, sceB3_SOC, sceB4_ROM, sceB4_SOC) #%>% 
+  #select(-c(.groups))
+
+# Use kable to print the table
+kable(tableB_null,
+      col.names = c("", "Median", "Q1", "Q3", "Median", "Q1", "Q3", "Median", "Q1", "Q3",
+                    "Median", "Q1", "Q3", "Median", "Q1", "Q3", "Median", "Q1", "Q3", 
+                    "Median", "Q1", "Q3"),
+      align = 'c') %>% 
+  kable_classic() %>% 
+  #kable_paper("striped", full_width = F) %>%
+  add_header_above(c(" " = 1, "N After Anchor Event Exclusion Criteria" = 3,
+                     "N with Severe Underlying ITP" = 3,
+                     "N with Less-Severe Underlying ITP" = 3,
+                     "Mean of Platelet Counts Prior to Anchor" = 3, 
+                     "SD of Platelet Counts Prior to Anchor" = 3, 
+                     "Mean of Platelet Counts After Anchor " = 3, 
+                     "SD of Platelet Counts After Anchor" = 3)) %>% 
+  pack_rows("Scenario B1", 1, 2) %>%
+  # pack_rows("Scenario B2", 3, 4) %>% 
+  # pack_rows("Scenario B3", 5, 6) %>% 
+  # pack_rows("Scenario B4", 7, 8) %>% 
+  footnote(general = "Mean and Standard Deviation values for platelet counts are calculated over all simulations within a specific scenario and treatment group.")
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+# Simulate the tables for each scenario
+
+## Scenario B1
+sceB1_ROM <- kable_table_ROM(B150)
+sceB1_SOC <- kable_table_SOC(B150)
+## Scenario B2
+sceB2_ROM <- kable_table_ROM(B250)
+sceB2_SOC <- kable_table_SOC(B250)
+## Scenario B3
+sceB3_ROM <- kable_table_ROM(B350)
+sceB3_SOC <- kable_table_SOC(B350)
+## Scenario B4
+sceB4_ROM <- kable_table_ROM(B450)
+sceB4_SOC <- kable_table_SOC(B450)
+
+
+# Create the table
+tableB_null <- rbind(sceB1_ROM, sceB1_SOC)#, sceB2_ROM, sceB2_SOC, 
+                     #sceB3_ROM, sceB3_SOC, sceB4_ROM, sceB4_SOC) #%>% 
+  #select(-c(.groups))
+
+# Use kable to print the table
+kable(tableB_null,
+      col.names = c("", "Median", "Q1", "Q3", "Median", "Q1", "Q3", "Median", "Q1", "Q3",
+                    "Median", "Q1", "Q3", "Median", "Q1", "Q3", "Median", "Q1", "Q3", 
+                    "Median", "Q1", "Q3"),
+      align = 'c') %>% 
+  kable_classic() %>% 
+  #kable_paper("striped", full_width = F) %>%
+  add_header_above(c(" " = 1, "N After Anchor Event Exclusion Criteria" = 3,
+                     "N with Severe Underlying ITP" = 3,
+                     "N with Less-Severe Underlying ITP" = 3,
+                     "Mean of Platelet Counts Prior to Anchor" = 3, 
+                     "SD of Platelet Counts Prior to Anchor" = 3, 
+                     "Mean of Platelet Counts After Anchor " = 3, 
+                     "SD of Platelet Counts After Anchor" = 3)) %>% 
+  pack_rows("Scenario B1", 1, 2) %>%
+  # pack_rows("Scenario B2", 3, 4) %>% 
+  # pack_rows("Scenario B3", 5, 6) %>% 
+  # pack_rows("Scenario B4", 7, 8) %>% 
+  footnote(general = "Mean and Standard Deviation values for platelet counts are calculated over all simulations within a specific scenario and treatment group.")
+
+```
+
+## N = 200; RCT Results
+
+### Null Effect
+
+```{r}
+
+# Simulate the tables for each scenario
+
+## Scenario R1
+sceR1_ROM <- kable_table_ROM(R1)
+sceR1_SOC <- kable_table_SOC(R1)
+## Scenario R3
+sceR3_ROM <- kable_table_ROM(R3)
+sceR3_SOC <- kable_table_SOC(R3)
+
+# Create the table
+tableR_null <- rbind(sceR1_ROM, sceR1_SOC,
+                     sceR3_ROM, sceR3_SOC)
+
+# Use kable to print the table
+kable(tableR_null,
+      col.names = c("", "Median", "Q1", "Q3", "Median", "Q1", "Q3", "Median", "Q1", "Q3",
+                    "Median", "Q1", "Q3", "Median", "Q1", "Q3", "Median", "Q1", "Q3", 
+                    "Median", "Q1", "Q3"),
+      align = 'c') %>% 
+  kable_classic() %>% 
+  #kable_paper("striped", full_width = F) %>%
+  add_header_above(c(" " = 1, "N After Anchor Event Exclusion Criteria" = 3,
+                     "N with Severe Underlying ITP" = 3,
+                     "N with Less-Severe Underlying ITP" = 3,
+                     "Mean of Platelet Counts Prior to Anchor" = 3, 
+                     "SD of Platelet Counts Prior to Anchor" = 3, 
+                     "Mean of Platelet Counts After Anchor " = 3, 
+                     "SD of Platelet Counts After Anchor" = 3)) %>% 
+  pack_rows("Scenario R1", 1, 2) %>%
+  pack_rows("Scenario R3", 3, 4) %>% 
+  footnote(general = "Mean and Standard Deviation values for platelet counts are calculated over all simulations within a specific scenario and treatment group.")
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+# Simulate the tables for each scenario
+
+## Scenario R1
+sceR1_ROM <- kable_table_ROM(R150)
+sceR1_SOC <- kable_table_SOC(R150)
+## Scenario R3
+sceR3_ROM <- kable_table_ROM(R350)
+sceR3_SOC <- kable_table_SOC(R350)
+
+# Create the table
+tableR_null <- rbind(sceR1_ROM, sceR1_SOC,
+                     sceR3_ROM, sceR3_SOC)
+
+# Use kable to print the table
+kable(tableR_null,
+      col.names = c("", "Median", "Q1", "Q3", "Median", "Q1", "Q3", "Median", "Q1", "Q3",
+                    "Median", "Q1", "Q3", "Median", "Q1", "Q3", "Median", "Q1", "Q3", 
+                    "Median", "Q1", "Q3"),
+      align = 'c') %>% 
+  kable_classic() %>% 
+  #kable_paper("striped", full_width = F) %>%
+  add_header_above(c(" " = 1, "N After Anchor Event Exclusion Criteria" = 3,
+                     "N with Severe Underlying ITP" = 3,
+                     "N with Less-Severe Underlying ITP" = 3,
+                     "Mean of Platelet Counts Prior to Anchor" = 3, 
+                     "SD of Platelet Counts Prior to Anchor" = 3, 
+                     "Mean of Platelet Counts After Anchor " = 3, 
+                     "SD of Platelet Counts After Anchor" = 3)) %>% 
+  pack_rows("Scenario R1", 1, 2) %>%
+  pack_rows("Scenario R3", 3, 4) %>% 
+  footnote(general = "Mean and Standard Deviation values for platelet counts are calculated over all simulations within a specific scenario and treatment group.")
+
+```
+
+# Visualizing the Simulations
+
+The code below prints a violin plot for the median difference in platelet counts over the simulations.
+
+```{r}
+
+graph_md <- function(dat, effect = 0, title){
+  
+  # Gather the datset to be long, with the minimum number of variables so that it can be plotted
+  plot <- dat %>% 
+  select(sim_id, md_noPS, md_PSgold, md_PSmean, md_PSsd, md_PSrdiff, md_PSlargest) %>% 
+  pivot_longer(cols = c(md_noPS, md_PSgold, md_PSmean, md_PSsd, md_PSrdiff, md_PSlargest), 
+               names_to = "PS_adj", values_to = "estimate")
+  
+  plot %>% 
+  ggplot(aes(x = PS_adj, y = as.integer(estimate))) +
+    geom_violin(trim = FALSE) +
+    geom_hline(yintercept = effect, linetype = "dashed", color = "red") +
+    labs(title = paste0("Median Difference Platelet Count Estimate by Adjustment Method for ",
+                        title), 
+         x = "Adjustment Method", 
+         y = "Median Difference in Platelet Count") +
+    scale_x_discrete(
+      breaks=c("md_noPS","md_PSgold", "md_PSlargest", "md_PSmean","md_PSrdiff",
+               "md_PSsd"),
+      labels=c("None", "Gold Standard PS", "Largest Diff PS", "Mean PS", "Recent Diff PS", 
+               "Std Dev PS")
+      ) +
+    geom_jitter(width = 0.1, size = 1) +
+    theme_bw()
+}
+
+
+```
+
+# Plot Median Differences
+
+Use the previous function to plot the median differences across all 2,000 simulations for each scenario.
+
+## Scenario A1
+
+* Number of participants in initial cohort (N): 10,000
+
+* More Severe ITP: $\mu = 40 \text{, } \sigma = 15$
+
+  + Probability of SOC = 0.4; Probability of ROM = 0.6
+  
+* Less Severe ITP: $\mu = 100 \text{, } \sigma = 50$
+
+  + Probability of SOC = 0.6; Probability of ROM = 0.4
+
+### Null Effect
+
+```{r}
+
+graph_md(A1, title = "Scenario A1")
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+graph_md(A150, effect=50, title = "Scenario A1 Non-Null")
+
+```
+
+
+## Scenario A2
+
+* Number of participants in initial cohort (N): 10,000
+
+* More Severe ITP: $\mu = 40 \text{, } \sigma = 15$
+
+  + Probability of SOC = 0.2; Probability of ROM = 0.8
+  
+* Less Severe ITP: $\mu = 100 \text{, } \sigma = 50$
+
+  + Probability of SOC = 0.8; Probability of ROM = 0.2
+  
+### Null Effect
+
+```{r}
+
+graph_md(A2, title = "Scenario A2")
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+graph_md(A250, effect=50, title = "Scenario A2 Non-Null")
+
+```
+
+
+## Scenario A3
+
+* Number of participants in initial cohort (N): 10,000
+
+* More Severe ITP: $\mu = 35 \text{, } \sigma = 10$
+
+  + Probability of SOC = 0.4; Probability of ROM = 0.6
+  
+* Less Severe ITP: $\mu = 55 \text{, } \sigma = 20$
+
+  + Probability of SOC = 0.6; Probability of ROM = 0.4
+
+### Null Effect
+
+```{r}
+
+graph_md(A3, title = "Scenario A3")
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+graph_md(A350, effect=50, title = "Scenario A3 Non-Null")
+
+```
+
+## Scenario A4
+
+* Number of participants in initial cohort (N): 10,000
+
+* More Severe ITP: $\mu = 35 \text{, } \sigma = 10$
+
+  + Probability of SOC = 0.2; Probability of ROM = 0.8
+  
+* Less Severe ITP: $\mu = 55 \text{, } \sigma = 20$
+
+  + Probability of SOC = 0.8; Probability of ROM = 0.2
+
+### Null Effect
+
+```{r}
+
+graph_md(A4, title = "Scenario A4")
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+graph_md(A450, effect=50, title = "Scenario A4 Non-Null")
+
+```
+
+## Scenario RA1
+
+* Number of participants in initial cohort (N): 10,000
+
+* More Severe ITP: $\mu = 40 \text{, } \sigma = 15$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+  
+* Less Severe ITP: $\mu = 100 \text{, } \sigma = 50$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+
+### Null Effect
+
+```{r}
+
+graph_md(RA1, title = "Scenario RA1")
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+graph_md(RA150, effect=50, title = "Scenario RA1 Non-Null")
+
+```
+
+## Scenario RA3
+
+* Number of participants in initial cohort (N): 10,000
+
+* More Severe ITP: $\mu = 35 \text{, } \sigma = 10$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+  
+* Less Severe ITP: $\mu = 55 \text{, } \sigma = 20$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+
+### Null Effect
+
+```{r}
+
+graph_md(RA3, title = "Scenario RA3")
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+graph_md(RA350, effect=50, title = "Scenario RA3 Non-Null")
+
+```
+
+
+## Scenario B1
+
+* Number of participants in initial cohort (N): 200
+
+* More Severe ITP: $\mu = 40 \text{, } \sigma = 15$
+
+  + Probability of SOC = 0.4; Probability of ROM = 0.6
+  
+* Less Severe ITP: $\mu = 100 \text{, } \sigma = 50$
+
+  + Probability of SOC = 0.6; Probability of ROM = 0.4
+
+### Null Effect
+
+```{r}
+
+graph_md(B1, title = "Scenario B1")
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+graph_md(B150, effect=50, title = "Scenario B1 Non-Null")
+
+```
+
+## Scenario B2
+
+* Number of participants in initial cohort (N): 200
+
+* More Severe ITP: $\mu = 40 \text{, } \sigma = 15$
+
+  + Probability of SOC = 0.2; Probability of ROM = 0.8
+  
+* Less Severe ITP: $\mu = 100 \text{, } \sigma = 50$
+
+  + Probability of SOC = 0.8; Probability of ROM = 0.2
+  
+### Null Effect
+
+```{r}
+
+graph_md(B2, title = "Scenario B2")
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+graph_md(B250, effect=50, title = "Scenario B2 Non-Null")
+
+```
+
+
+## Scenario B3
+
+* Number of participants in initial cohort (N): 200
+
+* More Severe ITP: $\mu = 35 \text{, } \sigma = 10$
+
+  + Probability of SOC = 0.4; Probability of ROM = 0.6
+  
+* Less Severe ITP: $\mu = 55 \text{, } \sigma = 20$
+
+  + Probability of SOC = 0.6; Probability of ROM = 0.4
+  
+### Null Effect
+
+```{r}
+
+graph_md(B3, title = "Scenario B3")
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+graph_md(B350, effect=50, title = "Scenario B3 Non-Null")
+
+```
+
+
+## Scenario B4
+
+* Number of participants in initial cohort (N): 200
+
+* More Severe ITP: $\mu = 35 \text{, } \sigma = 10$
+
+  + Probability of SOC = 0.2; Probability of ROM = 0.8
+  
+* Less Severe ITP: $\mu = 55 \text{, } \sigma = 20$
+
+  + Probability of SOC = 0.8; Probability of ROM = 0.2
+  
+### Null Effect
+
+```{r}
+
+graph_md(B4, title = "Scenario B4")
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+graph_md(B450, effect=50, title = "Scenario B4 Non-Null")
+
+```
+
+## Scenario RB1
+
+* Number of participants in initial cohort (N): 200
+
+* More Severe ITP: $\mu = 40 \text{, } \sigma = 15$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+  
+* Less Severe ITP: $\mu = 100 \text{, } \sigma = 50$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+
+### Null Effect
+
+```{r}
+
+graph_md(R1, title = "Scenario RB1")
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+graph_md(RB150, effect=50, title = "Scenario RB1 Non-Null")
+
+```
+
+## Scenario RB3
+
+* Number of participants in initial cohort (N): 200
+
+* More Severe ITP: $\mu = 35 \text{, } \sigma = 10$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+  
+* Less Severe ITP: $\mu = 55 \text{, } \sigma = 20$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+  
+### Null Effect
+
+```{r}
+
+graph_md(R3, title = "Scenario RB3")
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+graph_md(RB350, effect=50, title = "Scenario RB3 Non-Null")
+
+```
+
+
+
+# Performance Assessment Function
+
+The goal for this code is to write functions that calculate the performance assessment measures that we were planning on from the SAP/RPP.
+
+```{r}
+
+# Calculate the performance assessment measures in this function. This should be run on a dataset after calculating the median platelet count on all the simulations (i.e., after the analysis2() function is run).
+
+performance <- function(dat, effect = 0){
+  
+  dat <- dat %>% 
+    select(md_noPS, md_PSgold, md_PSmean, md_PSsd, md_PSrdiff, md_PSlargest)
+    
+  # Make a small dataset for the effect estimates without PS adjustment
+  noPS <- dat %>%
+  ungroup() %>% 
+  summarize(name = "No PS adjustment",
+            Bias = round(( sum( as.double(md_noPS) - effect )) / nrow(dat), 2),
+            ESE = round(sqrt(( sum((as.double(md_noPS) - mean(as.double(md_noPS)))^2) / 
+                                 (nrow(dat)-1) )), 2),
+            MSE = round(( sum((as.double(md_noPS) - effect)^2) / nrow(dat)), 2))
+  
+  # Make a small dataset for the effect estimates with PS calculated
+    ## using known, underlying ITP severity
+  PSgold <- dat %>% 
+    ungroup() %>% 
+    summarize(name = "PS calculated from underlying ITP severity",
+              Bias = round(( sum( as.double(md_PSgold) - effect)) / nrow(dat), 2),
+              ESE = round(sqrt(( sum((as.double(md_PSgold) - mean(as.double(md_PSgold)))^2) /
+                             (nrow(dat)-1) )), 2),
+              MSE = round(( sum((as.double(md_PSgold) - effect)^2) / nrow(dat)), 2))
+  
+  # Make a small dataset for the effect estimates with PS calculated 
+    ## using mean prior platelet count
+  PSmean <- dat %>% 
+  ungroup() %>% 
+  summarize(name = "PS calculated from prior platelet count mean",
+            Bias = round(( sum( as.double(md_PSmean) - effect)) / nrow (dat), 2),
+            ESE = round(sqrt(( sum((as.double(md_PSmean) - mean(as.double(md_PSmean)))^2) / 
+                           (nrow(dat)-1) )), 2),
+            MSE = round(( sum((as.double(md_PSmean) - effect)^2) / nrow(dat)), 2))
+  
+  # Make a small dataset for the effect estimates with PS calculated
+    ## using standard deviation of prior platelet count
+  PSsd <- dat %>% 
+  ungroup() %>% 
+  summarize(name = "PS calculated from prior platelet count sd",
+            Bias = round(( sum( as.double(md_PSsd) - effect)) / nrow (dat), 2),
+            ESE = round(sqrt(( sum((as.double(md_PSsd) - mean(as.double(md_PSsd)))^2) / 
+                           (nrow(dat)-1) )), 2),
+            MSE = round(( sum((as.double(md_PSsd) - effect)^2) / nrow(dat)), 2))
+  
+  # Make a small dataset for the effect estimates with PS calculated
+    ## using most recent difference in prior platelet count
+  PSrdiff <- dat %>% 
+  ungroup() %>% 
+  summarize(name = "PS calculated from most recent prior platelet count difference",
+            Bias = round(( sum( as.double(md_PSrdiff) - effect)) / nrow (dat), 2),
+            ESE = round(sqrt(( sum((as.double(md_PSrdiff) - mean(as.double(md_PSrdiff)))^2) /
+                           (nrow(dat)-1) )), 2),
+            MSE = round(( sum((as.double(md_PSrdiff) - effect)^2) / nrow(dat)), 2))
+  
+  # Make a small dataset for the effect estimates with PS calculated
+    ## using largest different in prior platelet count
+  PSlargest <- dat %>% 
+  ungroup() %>% 
+  summarize(name = "PS calculated from largest prior platelet count difference",
+            Bias = round(( sum( as.double(md_PSlargest) - effect)) / nrow (dat), 2),
+            ESE = round(sqrt(( sum((as.double(md_PSlargest) - mean(as.double(md_PSlargest)))^2) /
+                           (nrow(dat)-1) )), 2),
+            MSE = round(( sum((as.double(md_PSlargest) - effect)^2) / nrow(dat)), 2))
+  
+  combined <- rbind(noPS, PSgold, PSlargest, PSmean, PSrdiff, PSsd)
+  
+  k <- kable(combined,
+             col.names = c("Adjustment Method", "Bias", "Empirical Standard Error", 
+                           "Mean Square Error"),
+             align = "lccc") %>% 
+    kable_classic()
+  
+  return(k)
+  
+}
+
+```
+
+
+# Assess Simulation Runs
+
+The code below actually runs the performance() function on the simulated data after the propensity scores and median platelet counts are calculated.
+
+## Scenario A1
+
+* Number of participants in initial cohort (N): 10,000
+
+* More Severe ITP: $\mu = 40 \text{, } \sigma = 15$
+
+  + Probability of SOC = 0.4; Probability of ROM = 0.6
+  
+* Less Severe ITP: $\mu = 100 \text{, } \sigma = 50$
+
+  + Probability of SOC = 0.6; Probability of ROM = 0.4
+
+### Null Effect
+
+```{r}
+
+performance(A1)
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+performance(A150, effect=50)
+
+```
+
+## Scenario A2
+
+* Number of participants in initial cohort (N): 10,000
+
+* More Severe ITP: $\mu = 40 \text{, } \sigma = 15$
+
+  + Probability of SOC = 0.2; Probability of ROM = 0.8
+  
+* Less Severe ITP: $\mu = 100 \text{, } \sigma = 50$
+
+  + Probability of SOC = 0.8; Probability of ROM = 0.2
+  
+### Null Effect
+
+```{r}
+
+performance(A2)
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+performance(A250, effect=50)
+
+```
+
+
+## Scenario A3
+
+* Number of participants in initial cohort (N): 10,000
+
+* More Severe ITP: $\mu = 35 \text{, } \sigma = 10$
+
+  + Probability of SOC = 0.4; Probability of ROM = 0.6
+  
+* Less Severe ITP: $\mu = 55 \text{, } \sigma = 20$
+
+  + Probability of SOC = 0.6; Probability of ROM = 0.4
+
+### Null Effect
+
+```{r}
+
+performance(A3)
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+performance(A350, effect=50)
+
+```
+
+
+## Scenario A4
+
+* Number of participants in initial cohort (N): 10,000
+
+* More Severe ITP: $\mu = 35 \text{, } \sigma = 10$
+
+  + Probability of SOC = 0.2; Probability of ROM = 0.8
+  
+* Less Severe ITP: $\mu = 55 \text{, } \sigma = 20$
+
+  + Probability of SOC = 0.8; Probability of ROM = 0.2
+
+### Null Effect
+
+```{r}
+
+performance(A4)
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+performance(A450, effect=50)
+
+```
+
+
+## Scenario RA1
+
+* Number of participants in initial cohort (N): 10,000
+
+* More Severe ITP: $\mu = 40 \text{, } \sigma = 15$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+  
+* Less Severe ITP: $\mu = 100 \text{, } \sigma = 50$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+
+### Null Effect
+
+```{r}
+
+performance(RA1)
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+performance(RA150, effect=50)
+
+```
+
+
+## Scenario RA3
+
+* Number of participants in initial cohort (N): 10,000
+
+* More Severe ITP: $\mu = 35 \text{, } \sigma = 10$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+  
+* Less Severe ITP: $\mu = 55 \text{, } \sigma = 20$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+
+### Null Effect
+
+```{r}
+
+performance(RA3)
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+performance(RA350, effect=50)
+
+```
+
+
+## Scenario B1
+
+* Number of participants in initial cohort (N): 200
+
+* More Severe ITP: $\mu = 40 \text{, } \sigma = 15$
+
+  + Probability of SOC = 0.4; Probability of ROM = 0.6
+  
+* Less Severe ITP: $\mu = 100 \text{, } \sigma = 50$
+
+  + Probability of SOC = 0.6; Probability of ROM = 0.4
+
+### Null Effect
+
+```{r}
+
+performance(B1)
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+performance(B150, effect=50)
+
+```
+
+
+## Scenario B2
+
+* Number of participants in initial cohort (N): 200
+
+* More Severe ITP: $\mu = 40 \text{, } \sigma = 15$
+
+  + Probability of SOC = 0.2; Probability of ROM = 0.8
+  
+* Less Severe ITP: $\mu = 100 \text{, } \sigma = 50$
+
+  + Probability of SOC = 0.8; Probability of ROM = 0.2
+  
+### Null Effect
+
+```{r}
+
+performance(B2)
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+performance(B250, effect=50)
+
+```
+
+
+## Scenario B3
+
+* Number of participants in initial cohort (N): 200
+
+* More Severe ITP: $\mu = 35 \text{, } \sigma = 10$
+
+  + Probability of SOC = 0.4; Probability of ROM = 0.6
+  
+* Less Severe ITP: $\mu = 55 \text{, } \sigma = 20$
+
+  + Probability of SOC = 0.6; Probability of ROM = 0.4
+  
+### Null Effect
+
+```{r}
+
+performance(B3)
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+performance(B350, effect=50)
+
+```
+
+
+## Scenario B4
+
+* Number of participants in initial cohort (N): 200
+
+* More Severe ITP: $\mu = 35 \text{, } \sigma = 10$
+
+  + Probability of SOC = 0.2; Probability of ROM = 0.8
+  
+* Less Severe ITP: $\mu = 55 \text{, } \sigma = 20$
+
+  + Probability of SOC = 0.8; Probability of ROM = 0.2
+  
+### Null Effect
+
+```{r}
+
+performance(B4)
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+performance(B450, effect=50)
+
+```
+
+
+## Scenario RB1
+
+* Number of participants in initial cohort (N): 200
+
+* More Severe ITP: $\mu = 40 \text{, } \sigma = 15$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+  
+* Less Severe ITP: $\mu = 100 \text{, } \sigma = 50$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+
+### Null Effect
+
+```{r eval=FALSE}
+
+performance(R1)
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+performance(RB150, effect=50)
+
+```
+
+
+## Scenario RB3
+
+* Number of participants in initial cohort (N): 200
+
+* More Severe ITP: $\mu = 35 \text{, } \sigma = 10$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+  
+* Less Severe ITP: $\mu = 55 \text{, } \sigma = 20$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+  
+### Null Effect
+
+```{r}
+
+performance(R3)
+
+```
+
+### Non-Null Effect
+
+```{r}
+
+performance(RB350, effect=50)
+
+```
+
