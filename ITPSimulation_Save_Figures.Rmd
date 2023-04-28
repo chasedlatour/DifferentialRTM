@@ -1,0 +1,452 @@
+---
+title: "ITP Simulation"
+author: "Chase Latour"
+date: "6/22/2020"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Objective
+
+Save the figures generated in the ITP simulation analyses.
+
+
+```{r include=FALSE}
+
+# Load packages that need
+
+# Installed packages
+#renv::install(c("tidyr","purrr","knitr"))
+
+# Call necessary packages
+library(purrr)
+library(furrr)
+future::plan("sequential")
+# Alex recommends 'multisession' - Run as 'sequential' when on the test.stat server.
+library(dplyr) 
+library(tidyr)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+
+```
+
+
+# Load in Datasets
+
+Load in the already-simulated datasets that we need for the additional largest difference analysis.
+
+```{r}
+
+# N = 200
+
+B1 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/B1_all_corr_morePS.rds")
+
+B2 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/B2_all_corr_morePS.rds")
+
+B3 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/B3_all_corr_morePS.rds")
+
+B4 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/B4_all_corr_morePS.rds")
+
+RB1 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/RB1_all_corr_morePS.rds")
+
+RB3 <- readRDS("~/projects/P0047/users/chase.latour/plans/Simulated R Data/RB3_all_corr_morePS.rds")
+
+# # N = 1,000
+# 
+# A1 <- readRDS("~/projects/P0047/users/clatour/plans/Simulated R Data/A1_all_corr.rds")
+# 
+# A2 <- readRDS("~/projects/P0047/users/clatour/plans/Simulated R Data/A2_all_corr.rds")
+# 
+# A3 <- readRDS("~/projects/P0047/users/clatour/plans/Simulated R Data/A3_all_corr.rds")
+# 
+# A4 <- readRDS("~/projects/P0047/users/clatour/plans/Simulated R Data/A4_all_corr.rds")
+# 
+# RA1 <- readRDS("~/projects/P0047/users/clatour/plans/Simulated R Data/AB1_all_corr.rds")
+# 
+# RA3 <- readRDS("~/projects/P0047/users/clatour/plans/Simulated R Data/AB3_all_corr.rds")
+
+```
+
+# Plot Median Differences
+
+Use the previous function to plot the median differences across all 2,000 simulations for each scenario.
+
+## Function
+
+The code below prints a violin plot for the median difference in platelet counts over the simulations.
+
+```{r}
+
+graph_md_dots <- function(dat, effect = 0, title, subtitle){
+  
+  # Gather the datset to be long, with the minimum number of variables so that it can be plotted
+  plot <- dat %>% 
+  select(sim_id,  md_PSgold, md_PSmean, md_PSsd, md_PSrdiff, md_PSlargest, md_mean_sd, md_all) %>% 
+  pivot_longer(cols = c(md_PSgold, md_PSmean, md_PSsd, md_PSrdiff, md_PSlargest, md_mean_sd, md_all), 
+               names_to = "PS_adj", values_to = "estimate")
+  
+  plot2 <- plot %>% 
+  ggplot(aes(x = PS_adj, y = as.integer(estimate))) +
+    geom_violin(trim = FALSE) +
+    geom_hline(yintercept = effect, linetype = "dashed", color = "red") +
+    labs(title = paste0("Median Difference Estimate by Adjustment Method for ",
+                        title), 
+         subtitle = paste0(subtitle),
+         x = "Adjustment Method", 
+         y = "Median Difference of Platelet Counts") +
+    scale_x_discrete(
+      limits=c("md_PSmean", "md_PSsd", "md_PSrdiff",
+                "md_PSlargest", "md_mean_sd", "md_all","md_PSgold"),
+      labels=c("Mean", "Standard Dev", "Most Recent", "Largest", "Mean and SD", "All",
+               "ITP Strata")
+      ) +
+    geom_jitter(width = 0.1, size = 0.25) +
+    theme_bw()
+  
+    ggsave(filename = paste(title, "with dots_morePS.jpeg"),
+         plot = plot2,
+         path = "~/projects/P0047/users/chase.latour/plans/Figures/",
+         units = "in",
+         width = 7,
+         height = 5)
+    
+    return(plot2)
+    
+} 
+
+
+
+graph_md_nodots <- function(dat, effect = 0, title, subtitle){
+  
+  # Gather the datset to be long, with the minimum number of variables so that it can be plotted
+  plot <- dat %>% 
+  select(sim_id, md_PSmean, md_PSsd, md_PSrdiff, md_PSlargest, md_PSgold, md_mean_sd, md_all) %>% 
+  pivot_longer(cols = c(md_PSmean, md_PSsd, md_PSrdiff, md_PSlargest, md_PSgold, md_mean_sd, md_all), 
+               names_to = "PS_adj", values_to = "estimate")
+  
+  plot2 <- plot %>% 
+  ggplot(aes(x = PS_adj, y = as.integer(estimate))) +
+    geom_violin(trim = FALSE) +
+    geom_hline(yintercept = effect, linetype = "dashed", color = "gray") +
+    labs(title = paste0("Median Difference Estimates for ",
+                        title), 
+         x = element_blank(), 
+         y = "Median Difference",
+         caption = "The star indicates the median of the differences between the two treatment groups' median follow-up platelet counts.") +
+    scale_x_discrete(
+      limits=c("md_PSmean", "md_PSsd", "md_PSrdiff",
+                "md_PSlargest", "md_mean_sd", "md_all","md_PSgold"),
+      labels=c("Mean", "Standard Dev", "Most Recent", "Largest", "Mean and SD", "All",
+               "Gold Standard"),
+      
+      ) +
+    scale_y_continuous(limits = c(-50,15)) +
+    #geom_jitter(width = 0.1, size = 1) +
+    theme_bw() +
+    theme(axis.text.x = element_text(size=rel(1.35), colour = 'black'),
+          axis.text.y = element_text(size = rel(1.15), colour = 'black')) +
+    ggplot2::stat_summary(fun = median, geom = "point", color = 'black',
+                          size = 1.25, shape = 8)
+  
+  ggsave(filename = paste(title, "without dots_morePS.jpeg"),
+         plot = plot2,
+         path = "~/projects/P0047/users/chase.latour/plans/Figures/",
+         units = "in",
+         width = 7,
+         height = 5)
+  
+  return(plot2)
+}
+
+# Look here for info on editing tick marks: https://www.datanovia.com/en/blog/ggplot-axis-ticks-set-and-rotate-text-labels/
+
+```
+
+## Scenario B1
+
+* Number of participants in initial cohort (N): 200
+
+* More Severe ITP: $\mu = 40 \text{, } \sigma = 15$
+
+  + Probability of SOC = 0.4; Probability of ROM = 0.6
+  
+* Less Severe ITP: $\mu = 100 \text{, } \sigma = 50$
+
+  + Probability of SOC = 0.6; Probability of ROM = 0.4
+
+### Null Effect
+
+```{r}
+
+#graph_md_dots(B1, title = "Scenario B1")
+
+graph_md_nodots(B1, title = "Scenario B1")
+
+```
+
+
+## Scenario B2
+
+* Number of participants in initial cohort (N): 200
+
+* More Severe ITP: $\mu = 40 \text{, } \sigma = 15$
+
+  + Probability of SOC = 0.2; Probability of ROM = 0.8
+  
+* Less Severe ITP: $\mu = 100 \text{, } \sigma = 50$
+
+  + Probability of SOC = 0.8; Probability of ROM = 0.2
+  
+### Null Effect
+
+```{r}
+
+#graph_md_dots(B2, title = "Scenario B2")
+
+graph_md_nodots(B2, title = "Scenario B2")
+
+```
+
+
+## Scenario B3
+
+* Number of participants in initial cohort (N): 200
+
+* More Severe ITP: $\mu = 35 \text{, } \sigma = 10$
+
+  + Probability of SOC = 0.4; Probability of ROM = 0.6
+  
+* Less Severe ITP: $\mu = 55 \text{, } \sigma = 20$
+
+  + Probability of SOC = 0.6; Probability of ROM = 0.4
+  
+### Null Effect
+
+```{r}
+
+#graph_md_dots(B3, title = "Scenario B3")
+
+graph_md_nodots(B3, title = "Scenario B3")
+
+```
+
+
+## Scenario B4
+
+* Number of participants in initial cohort (N): 200
+
+* More Severe ITP: $\mu = 35 \text{, } \sigma = 10$
+
+  + Probability of SOC = 0.2; Probability of ROM = 0.8
+  
+* Less Severe ITP: $\mu = 55 \text{, } \sigma = 20$
+
+  + Probability of SOC = 0.8; Probability of ROM = 0.2
+  
+### Null Effect
+
+```{r}
+
+#graph_md_dots(B4, title = "Scenario B4")
+
+graph_md_nodots(B4, title = "Scenario B4")
+
+```
+
+
+## Scenario RB1
+
+* Number of participants in initial cohort (N): 200
+
+* More Severe ITP: $\mu = 40 \text{, } \sigma = 15$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+  
+* Less Severe ITP: $\mu = 100 \text{, } \sigma = 50$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+
+### Null Effect
+
+```{r}
+
+#graph_md_dots(RB1, title = "Scenario B5")
+
+graph_md_nodots(RB1, title = "Scenario B5")
+
+```
+
+
+## Scenario RB3
+
+* Number of participants in initial cohort (N): 200
+
+* More Severe ITP: $\mu = 35 \text{, } \sigma = 10$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+  
+* Less Severe ITP: $\mu = 55 \text{, } \sigma = 20$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+  
+### Null Effect
+
+```{r}
+
+#graph_md_dots(RB3, title = "Scenario B6")
+
+graph_md_nodots(RB3, title = "Scenario B6")
+
+```
+
+
+
+**ALL THE SCENARIO A'S RIGHT NOW ARE WRITTEN FOR THE ICPE PRESENTATION SLIDES, NOT FOR THE MANUSCRIPT**
+
+## Scenario A1
+
+* Number of participants in initial cohort (N): 1,000
+
+* More Severe ITP: $\mu = 40 \text{, } \sigma = 15$
+
+  + Probability of SOC = 0.4; Probability of ROM = 0.6
+  
+* Less Severe ITP: $\mu = 100 \text{, } \sigma = 50$
+
+  + Probability of SOC = 0.6; Probability of ROM = 0.4
+
+### Null Effect
+
+```{r eval=FALSE}
+
+#graph_md_dots(A1, title = "Scenario A1")
+
+graph_md_nodots(A1, title = "Scenario 2A", 
+                subtitle = "Weakly Differential, Platelet Count Distributions Disparate")
+
+```
+
+
+## Scenario A2
+
+* Number of participants in initial cohort (N): 1,000
+
+* More Severe ITP: $\mu = 40 \text{, } \sigma = 15$
+
+  + Probability of SOC = 0.2; Probability of ROM = 0.8
+  
+* Less Severe ITP: $\mu = 100 \text{, } \sigma = 50$
+
+  + Probability of SOC = 0.8; Probability of ROM = 0.2
+  
+### Null Effect
+
+```{r eval=FALSE}
+
+#graph_md_dots(A2, title = "Scenario A2")
+
+graph_md_nodots(A2, title = "Scenario A2")
+
+```
+
+
+## Scenario A3
+
+* Number of participants in initial cohort (N): 200
+
+* More Severe ITP: $\mu = 35 \text{, } \sigma = 10$
+
+  + Probability of SOC = 0.4; Probability of ROM = 0.6
+  
+* Less Severe ITP: $\mu = 55 \text{, } \sigma = 20$
+
+  + Probability of SOC = 0.6; Probability of ROM = 0.4
+  
+### Null Effect
+
+```{r eval=FALSE}
+
+#graph_md_dots(A3, title = "Scenario A3")
+
+graph_md_nodots(A3, title = "Scenario A3")
+
+```
+
+
+## Scenario A4
+
+* Number of participants in initial cohort (N): 1,000
+
+* More Severe ITP: $\mu = 35 \text{, } \sigma = 10$
+
+  + Probability of SOC = 0.2; Probability of ROM = 0.8
+  
+* Less Severe ITP: $\mu = 55 \text{, } \sigma = 20$
+
+  + Probability of SOC = 0.8; Probability of ROM = 0.2
+  
+### Null Effect
+
+```{r eval=FALSE}
+
+#graph_md_dots(A4, title = "Scenario A4")
+
+graph_md_nodots(A4, title = "Scenario A4")
+
+```
+
+
+## Scenario RA1
+
+* Number of participants in initial cohort (N): 1,000
+
+* More Severe ITP: $\mu = 40 \text{, } \sigma = 15$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+  
+* Less Severe ITP: $\mu = 100 \text{, } \sigma = 50$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+
+### Null Effect
+
+```{r eval=FALSE}
+
+graph_md_dots(RA1, title = "Scenario A5")
+
+graph_md_nodots(RA1, title = "Scenario A5")
+
+```
+
+
+## Scenario RA3
+
+* Number of participants in initial cohort (N): 1,000
+
+* More Severe ITP: $\mu = 35 \text{, } \sigma = 10$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+  
+* Less Severe ITP: $\mu = 55 \text{, } \sigma = 20$
+
+  + Probability of SOC = 0.5; Probability of ROM = 0.5
+  
+### Null Effect
+
+```{r eval=FALSE}
+
+#graph_md_dots(RA3, title = "Scenario A6")
+
+graph_md_nodots(RA3, title = "Scenario A6")
+
+```
+
